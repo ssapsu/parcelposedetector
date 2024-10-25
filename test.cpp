@@ -7,7 +7,7 @@
 #include <chrono>
 #include <map>
 #include <string>
-#include <iomanip> // For std::setw for table print
+#include <iomanip> // For std::setw and std::setprecision for table print
 #include "Camera.h"
 #include "CameraConstants.h"
 
@@ -78,6 +78,113 @@ Eigen::Matrix3f averageRotationMatrices(const std::vector<Eigen::Matrix3f> &rot_
     return avg_q.toRotationMatrix();
 }
 
+void gripperToleranceCalculator(cv::Mat &frame,
+                  const Eigen::Vector3f &center,
+                  float radius, float height, float cut_height,
+                  const Eigen::Matrix3f &rotation_matrix,
+                  const cv::Mat &camera_matrix, const cv::Mat &dist_coeffs,
+                  const Eigen::Vector3f &t_cg,
+                  const Eigen::Vector3f &euler_angles)
+{
+    // Create 100 points around the circumference of the circles
+    const int num_points = 100;
+    std::vector<Eigen::Vector3f> top_circle_points(num_points), bottom_circle_points(num_points);
+
+    for (int i = 0; i < num_points; ++i)
+    {
+        float theta = 2 * M_PI * i / (num_points - 1); // Ensure full circle
+
+        // XZ plane for top and bottom circles
+        top_circle_points[i] = Eigen::Vector3f(radius * cos(theta), height / 2, radius * sin(theta));
+        bottom_circle_points[i] = Eigen::Vector3f(radius * cos(theta), -height / 2, radius * sin(theta));
+    }
+
+    // Combine circle points
+    std::vector<Eigen::Vector3f> cylinder_points;
+    cylinder_points.insert(cylinder_points.end(), top_circle_points.begin(), top_circle_points.end());
+    cylinder_points.insert(cylinder_points.end(), bottom_circle_points.begin(), bottom_circle_points.end());
+
+    // Apply cut height constraint and collect transformed points
+    std::vector<cv::Point3f> object_points;
+    for (const auto &point : cylinder_points)
+    {
+        if (point(2) >= cut_height)
+        {
+            // Rotate and translate points to camera space
+            Eigen::Vector3f transformed_point = rotation_matrix * point + center;
+            object_points.emplace_back(transformed_point(0), transformed_point(1), transformed_point(2));
+        }
+    }
+
+    // Project the points onto the image plane
+    std::vector<cv::Point2f> projected_points;
+    cv::projectPoints(object_points, cv::Vec3d::zeros(), cv::Vec3d::zeros(), camera_matrix, dist_coeffs, projected_points);
+
+    // Compute the gripper's tip in the camera frame
+    Eigen::AngleAxisf rollAngle(euler_angles(0), Eigen::Vector3f::UnitX());
+    Eigen::AngleAxisf pitchAngle(euler_angles(1), Eigen::Vector3f::UnitY());
+    Eigen::AngleAxisf yawAngle(euler_angles(2), Eigen::Vector3f::UnitZ());
+
+    Eigen::Matrix3f R_cg = (rollAngle * pitchAngle * yawAngle).matrix();
+    Eigen::Vector3f gripper_tip_camera_frame = R_cg * Eigen::Vector3f::Zero() + t_cg;
+
+    // Extract the gripper's tip coordinates
+    float gripper_x = gripper_tip_camera_frame(0);
+    float gripper_y = gripper_tip_camera_frame(1);
+    float gripper_z = gripper_tip_camera_frame(2);
+
+    // Debugging output for the gripper tip in the camera frame
+    std::cout << std::fixed << std::setprecision(4);
+    std::cout << "Gripper Tip in Camera Frame: X=" << gripper_x
+              << ", Y=" << gripper_y
+              << ", Z=" << -gripper_z << std::endl;
+
+    // Print cylinder parameters
+    std::cout << "Cylinder Center in Camera Frame: X=" << center(0)
+              << ", Y=" << center(1)
+              << ", Z=" << center(2) << std::endl;
+    std::cout << "Cylinder Radius: " << radius << ", Cylinder Height: ±" << (height / 2)
+              << ", Cut Height: " << cut_height << std::endl;
+
+    // Check if the gripper tip is inside the cylinder
+    bool within_height = (-height / 2 + center(1) + t_cg(1) <= gripper_y && gripper_y <= height / 2 + center(1) + t_cg(1));
+    std::cout << "Gripper Tip Height Check: " << (within_height ? "Pass" : "Fail")
+              << " (Tip Y=" << gripper_y << " within " << (-height / 2 + center(1) + t_cg(1)) << " to " << (height / 2 + center(1) + t_cg(1)) << ")" << std::endl;
+
+    float distance_from_center = std::sqrt(std::pow(gripper_x - center(0), 2) + std::pow(-gripper_z - center(2), 2));
+    bool within_radius = distance_from_center <= radius;
+    std::cout << "Gripper Tip Radius Check: " << (within_radius ? "Pass" : "Fail")
+              << " (Distance=" << distance_from_center << ", Radius=" << radius << ")" << std::endl;
+
+    bool gripper_inside_cylinder = within_height && within_radius;
+
+    std::cout << "Gripper Inside Cylinder Check: " << (gripper_inside_cylinder ? "Pass" : "Fail") << std::endl;
+
+    // Set color based on whether the gripper is inside the cylinder or not
+    cv::Scalar color = gripper_inside_cylinder ? cv::Scalar(255, 0, 0) : cv::Scalar(0, 0, 255); // Blue if inside, Red if outside
+
+    // Draw the projected points of the cylinder
+    for (size_t i = 0; i < projected_points.size() - 1; ++i)
+    {
+        cv::line(frame, projected_points[i], projected_points[i + 1], color, 10);
+    }
+    // Close the loop for the last point
+    if (!projected_points.empty())
+    {
+        cv::line(frame, projected_points.back(), projected_points[0], color, 2); // Thickness 2 for last line
+    }
+
+    // Final result message
+    if (gripper_inside_cylinder)
+    {
+        std::cout << "Gripper tip is inside the cylinder. Ready to grab the parcel!" << std::endl;
+    }
+    else
+    {
+        std::cout << "Gripper tip is outside the cylinder. Adjust the position." << std::endl;
+    }
+}
+
 int main()
 {
     // Define MARKER_SIZE and compute translations
@@ -87,6 +194,11 @@ int main()
     const float marker_translation_y = (60.0f - half_marker_size) / 1000.0f;
     const float marker_translation_z = 27.0f / 1000.0f;
 
+    Eigen::Matrix3f R_cam_to_grip;
+    R_cam_to_grip << 1, 0, 0,
+        0, 0, 1,
+        0, 1, 0;
+
     // Define marker models
     std::map<int, MarkerModel> marker_models = {
         {0, {{marker_translation_x, marker_translation_y, marker_translation_z}, "output.ply"}},
@@ -94,8 +206,8 @@ int main()
         {2, {{-marker_translation_x, -marker_translation_y, marker_translation_z}, "output.ply"}},
         {3, {{marker_translation_x, -marker_translation_y, marker_translation_z}, "output.ply"}}};
 
-    // **Define the camera's pose in the world frame**
-    Eigen::Vector3f t_wc(0.0f, -0.014f, -0.10f);
+    // **Define the drone's pose in the object (now considered world) frame**
+    Eigen::Vector3f t_cg(0.0f, -0.02f, -0.115f);
     Eigen::Vector3f euler_angles_deg(-20.0f, 0.0f, 0.0f);
     Eigen::Vector3f euler_angles_rad = euler_angles_deg * static_cast<float>(M_PI) / 180.0f;
 
@@ -103,7 +215,7 @@ int main()
     Eigen::AngleAxisf pitchAngle(euler_angles_rad(1), Eigen::Vector3f::UnitY());
     Eigen::AngleAxisf yawAngle(euler_angles_rad(2), Eigen::Vector3f::UnitZ());
 
-    Eigen::Matrix3f R_wc = (rollAngle * pitchAngle * yawAngle).matrix();
+    Eigen::Matrix3f R_cg = (rollAngle * pitchAngle * yawAngle).matrix();
 
     // Initialize the Camera object
     Camera camera(0, CameraType::CSI); // You can change to CameraType::WEBCAM for webcam
@@ -117,7 +229,8 @@ int main()
     float marker_length = 0.040f; // 40mm converted to meters
     cv::Ptr<cv::aruco::Dictionary> aruco_dict = cv::makePtr<cv::aruco::Dictionary>(cv::aruco::getPredefinedDictionary(cv::aruco::DICT_4X4_50));
     cv::Ptr<cv::aruco::DetectorParameters> parameters = cv::makePtr<cv::aruco::DetectorParameters>();
-
+    // set polygonalApproxAccuracy
+    parameters->polygonalApproxAccuracyRate = 0.008f;
     // Load the model once
     std::vector<Eigen::Vector3f> model_vertices = loadModel(marker_models[0].model_path);
 
@@ -166,6 +279,9 @@ int main()
 
             if (!ids.empty())
             {
+                // Draw detected markers
+                cv::aruco::drawDetectedMarkers(frame, corners, ids);
+
                 // Lists to store transformations
                 std::vector<Eigen::Vector3f> translations;
                 std::vector<Eigen::Matrix3f> rotations;
@@ -213,15 +329,16 @@ int main()
                     Eigen::Vector3f avg_translation = computeAverageTranslation(translations);
                     Eigen::Matrix3f avg_rotation = averageRotationMatrices(rotations);
 
-                    // Transform object pose from camera frame to world frame
+                    // **Transform from object (drone) frame to world frame**
                     Eigen::Matrix3f R_co = avg_rotation;
                     Eigen::Vector3f t_co = avg_translation;
 
-                    Eigen::Matrix3f R_wo = R_wc * R_co;
-                    Eigen::Vector3f t_wo = R_wc * t_co + t_wc;
+                    // Compute object's rotation and translation in gripper frame
+                    Eigen::Matrix3f R_go = R_cg * R_co;
+                    Eigen::Vector3f t_go = R_cg * t_co + t_cg;
 
                     // Add the object's position in the world frame to the list
-                    object_positions_world.push_back(t_wo);
+                    object_positions_world.push_back(t_go);
 
                     // Keep only the last 20 positions
                     if (object_positions_world.size() > max_positions)
@@ -282,6 +399,14 @@ int main()
                             cv::circle(frame, pt, 3, cv::Scalar(0, 255, 0), -1); // Green dots for vertices
                         }
                     }
+
+                    // Define cylinder parameters
+                    float radius = 0.027f;      // Define your cylinder's radius
+                    float height = 0.031f;      // Total height of ±0.031 meters (height / 2)
+                    float cut_height = -0.016f; // Z-plane cut height for the cylinder
+
+                    // Call the gripperToleranceCalculator function
+                    gripperToleranceCalculator(frame, avg_translation, radius, height, cut_height, avg_rotation, camera_matrix, dist_coeffs, t_cg, euler_angles_rad);
                 }
             }
 
